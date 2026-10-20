@@ -7,7 +7,7 @@ import android.os.Parcel
 
 interface IAgentStoreService : IInterface {
     fun readStore(storeId: String?): String?
-    fun writeStore(storeId: String?, json: String?)
+    fun writeStore(storeId: String?, json: String?): Boolean
     fun mutateStore(storeId: String?, path: String?, valueJson: String?): String?
     fun postNotification(title: String?, content: String?, uri: String?)
 
@@ -33,8 +33,9 @@ interface IAgentStoreService : IInterface {
                     data.enforceInterface(DESCRIPTOR)
                     val storeId = data.readString()
                     val json = data.readString()
-                    writeStore(storeId, json)
+                    val result = writeStore(storeId, json)
                     reply?.writeNoException()
+                    reply?.writeInt(if (result) 1 else 0)
                     return true
                 }
 
@@ -97,7 +98,7 @@ interface IAgentStoreService : IInterface {
                 }
             }
 
-            override fun writeStore(storeId: String?, json: String?) {
+            override fun writeStore(storeId: String?, json: String?): Boolean {
                 val data = Parcel.obtain()
                 val reply = Parcel.obtain()
                 try {
@@ -106,6 +107,7 @@ interface IAgentStoreService : IInterface {
                     data.writeString(json)
                     remote.transact(TRANSACTION_writeStore, data, reply, 0)
                     reply.readException()
+                    return reply.readInt() != 0
                 } finally {
                     reply.recycle()
                     data.recycle()

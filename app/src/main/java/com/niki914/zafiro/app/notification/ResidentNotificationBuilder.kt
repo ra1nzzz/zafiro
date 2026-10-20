@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import androidx.annotation.StringRes
 import androidx.core.app.NotificationCompat
 import com.niki914.zafiro.api.model.AgentState
@@ -14,7 +15,6 @@ import com.niki914.zafiro.app.R
 import com.niki914.zafiro.app.ui.model.ToolPresentation
 import com.niki914.zafiro.business.notification.AppNotificationChannel
 import com.niki914.zafiro.business.notification.NotificationChannelManager
-import com.niki914.zafiro.runtime.service.AgentRuntimeService
 
 /**
  * 常驻通知构建器。
@@ -34,8 +34,6 @@ object ResidentNotificationBuilder {
 
     private const val REQUEST_CODE_CONTENT = 101
     private const val REQUEST_CODE_STOP = 102
-    private const val REQUEST_CODE_APPROVE = 103
-    private const val REQUEST_CODE_DECLINE = 104
 
     const val COLOR_RUNNING: Int = 0xFF22C55E.toInt()
     const val COLOR_WAITING_APPROVAL: Int = 0xFFD97706.toInt()
@@ -136,27 +134,34 @@ object ResidentNotificationBuilder {
     }
 
     fun createStopIntent(context: Context): PendingIntent {
-        val intent = Intent(context, AgentRuntimeService::class.java).apply {
+        val intent = Intent(context, ApprovalActionReceiver::class.java).apply {
             action = ACTION_STOP
         }
         val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        return PendingIntent.getService(context, REQUEST_CODE_STOP, intent, flags)
+        return PendingIntent.getBroadcast(context, REQUEST_CODE_STOP, intent, flags)
     }
 
-    fun createApproveIntent(context: Context): PendingIntent {
-        val intent = Intent(context, AgentRuntimeService::class.java).apply {
-            action = ACTION_APPROVE
+    private fun createApprovalIntent(
+        context: Context,
+        request: ApprovalRequest?,
+        decisionAction: String,
+    ): PendingIntent? {
+        val binding = request?.let { ResidentNotificationManager.bindingFor(it) } ?: return null
+        val intent = Intent(context, ApprovalActionReceiver::class.java).apply {
+            action = decisionAction
+            data = Uri.Builder().scheme("zafiro-approval").authority("action")
+                .appendPath(binding.sessionId)
+                .appendPath(binding.requestId)
+                .appendPath(decisionAction)
+                .appendQueryParameter("digest", binding.operationDigest)
+                .build()
         }
-        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        return PendingIntent.getService(context, REQUEST_CODE_APPROVE, intent, flags)
-    }
-
-    fun createDeclineIntent(context: Context): PendingIntent {
-        val intent = Intent(context, AgentRuntimeService::class.java).apply {
-            action = ACTION_DECLINE
-        }
-        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        return PendingIntent.getService(context, REQUEST_CODE_DECLINE, intent, flags)
+        return PendingIntent.getBroadcast(
+            context,
+            (binding.requestId + decisionAction).hashCode(),
+            intent,
+            PendingIntent.FLAG_IMMUTABLE,
+        )
     }
 
     /**
@@ -168,8 +173,12 @@ object ResidentNotificationBuilder {
         status: AgentState,
         contentIntent: PendingIntent? = createContentIntent(context),
         stopIntent: PendingIntent? = createStopIntent(context),
-        approveIntent: PendingIntent? = createApproveIntent(context),
-        declineIntent: PendingIntent? = createDeclineIntent(context),
+        approveIntent: PendingIntent? = createApprovalIntent(
+            context, (status as? AgentState.WaitingApproval)?.request, ACTION_APPROVE,
+        ),
+        declineIntent: PendingIntent? = createApprovalIntent(
+            context, (status as? AgentState.WaitingApproval)?.request, ACTION_DECLINE,
+        ),
     ): Notification {
         return channelManager.buildNotification(AppNotificationChannel.Resident) {
             val icon = context.applicationInfo.icon.takeIf { it != 0 }

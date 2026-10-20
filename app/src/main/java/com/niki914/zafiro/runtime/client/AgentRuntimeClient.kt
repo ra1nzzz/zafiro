@@ -197,9 +197,9 @@ class AgentRuntimeClient(private val context: Context) : AssistantTextSource,
     override fun writeStore(storeId: String, json: String): Boolean {
         val svc = storeService ?: return false
         return try {
-            svc.writeStore(storeId, json)
-            Logger.i(LOG_TAG, "writeStore storeId=$storeId jsonLength=${json.length}")
-            true
+            val written = svc.writeStore(storeId, json)
+            Logger.i(LOG_TAG, "writeStore storeId=$storeId result=$written jsonLength=${json.length}")
+            written
         } catch (_: DeadObjectException) {
             onBinderUnreachable()
             Logger.w(LOG_TAG, "writeStore storeId=$storeId error=DeadObject")

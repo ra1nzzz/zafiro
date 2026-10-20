@@ -12,6 +12,8 @@ import com.niki914.zafiro.runtime.service.AgentRuntimeService
 import com.niki914.zafiro.service.requireService
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.suspendCancellableCoroutine
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 
 /**
@@ -26,37 +28,49 @@ object ResidentNotificationManager {
 
     private const val TAG = "niki914_zafiro_ResidentNotificationManager"
 
-    private var activeApprovalCont: CancellableContinuation<ApprovalDecision>? = null
-    var activeApprovalRequest: ApprovalRequest? = null
-        private set
+    private data class PendingApproval(
+        val request: ApprovalRequest,
+        val binding: ApprovalBinding,
+        val cont: CancellableContinuation<ApprovalDecision>,
+    )
+
+    private val sessionId = UUID.randomUUID().toString()
+    private val pendingApproval = AtomicReference<PendingApproval?>(null)
+    val activeApprovalRequest: ApprovalRequest? get() = pendingApproval.get()?.request
+
+    internal fun bindingFor(request: ApprovalRequest): ApprovalBinding? =
+        pendingApproval.get()?.takeIf { it.request === request && it.cont.isActive }?.binding
 
     private var approverRegistered = false
 
     internal val residentApprover = object : Approver {
         override suspend fun decide(request: ApprovalRequest): ApprovalDecision {
             return suspendCancellableCoroutine { cont ->
-                activeApprovalCont = cont
-                activeApprovalRequest = request
-                AgentRuntimeService.notifyUpdate()
+                val pending = PendingApproval(request, ApprovalBinding.create(sessionId, request), cont)
+                val previous = pendingApproval.getAndSet(pending)
+                previous?.cont?.resume(ApprovalDecision.Abstain)
                 cont.invokeOnCancellation {
-                    if (activeApprovalCont === cont) {
-                        activeApprovalCont = null
+                    if (pendingApproval.compareAndSet(pending, null)) {
+                        AgentRuntimeService.notifyUpdate()
                     }
-                    if (activeApprovalRequest == request) {
-                        activeApprovalRequest = null
-                    }
-                    AgentRuntimeService.notifyUpdate()
                 }
+                AgentRuntimeService.notifyUpdate()
             }
         }
     }
 
-    fun resolveApproval(decision: ApprovalDecision) {
-        val cont = activeApprovalCont
-        activeApprovalCont = null
-        activeApprovalRequest = null
-        cont?.resume(decision)
+    internal fun resolveApproval(binding: ApprovalBinding, decision: ApprovalDecision): Boolean {
+        val pending = pendingApproval.get()
+        if (pending == null || pending.binding != binding ||
+            binding.operationDigest != ApprovalBinding.digest(pending.request) ||
+            !pending.cont.isActive || !pendingApproval.compareAndSet(pending, null)
+        ) {
+            Logger.w(TAG, "Approval ignored: stale, mismatched or consumed requestId=${binding.requestId}")
+            return false
+        }
+        pending.cont.resume(decision)
         AgentRuntimeService.notifyUpdate()
+        return true
     }
 
     fun start(context: Context) {
@@ -84,10 +98,7 @@ object ResidentNotificationManager {
             agentControl?.removeApprover(residentApprover)
             approverRegistered = false
         }
-        val cont = activeApprovalCont
-        activeApprovalCont = null
-        activeApprovalRequest = null
-        cont?.cancel()
+        pendingApproval.getAndSet(null)?.cont?.cancel()
 
         val intent = Intent(context, AgentRuntimeService::class.java).apply {
             action = AgentRuntimeService.ACTION_STOP_RESIDENT
@@ -105,8 +116,6 @@ object ResidentNotificationManager {
             agentControl?.removeApprover(residentApprover)
             approverRegistered = false
         }
-        activeApprovalCont?.cancel()
-        activeApprovalCont = null
-        activeApprovalRequest = null
+        pendingApproval.getAndSet(null)?.cont?.cancel()
     }
 }

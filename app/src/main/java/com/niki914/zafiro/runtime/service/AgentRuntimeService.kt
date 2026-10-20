@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.Binder
 import android.os.DeadObjectException
 import android.os.IBinder
+import android.os.Process
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.net.toUri
@@ -20,11 +21,9 @@ import com.niki914.zafiro.api.AgentControl
 import com.niki914.zafiro.api.AgentManager
 import com.niki914.zafiro.api.TurnStart
 import com.niki914.zafiro.api.model.AgentState
-import com.niki914.zafiro.api.model.ApprovalDecision
 import com.niki914.zafiro.api.model.TurnFailureCode
 import com.niki914.zafiro.app.MainActivity
 import com.niki914.zafiro.app.notification.ResidentNotificationBuilder
-import com.niki914.zafiro.app.notification.ResidentNotificationManager
 import com.niki914.zafiro.app.notification.TurnNotificationManager
 import com.niki914.zafiro.business.notification.NotificationChannelManager
 import com.niki914.zafiro.business.permission.Permission
@@ -68,21 +67,6 @@ class AgentRuntimeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ResidentNotificationBuilder.ACTION_STOP -> {
-                Logger.i(LOG_TAG, "Resident notification: Stop clicked")
-                agentControl.stop()
-            }
-
-            ResidentNotificationBuilder.ACTION_APPROVE -> {
-                Logger.i(LOG_TAG, "Resident notification: Approve clicked")
-                ResidentNotificationManager.resolveApproval(ApprovalDecision.Allow)
-            }
-
-            ResidentNotificationBuilder.ACTION_DECLINE -> {
-                Logger.i(LOG_TAG, "Resident notification: Decline clicked")
-                ResidentNotificationManager.resolveApproval(ApprovalDecision.Deny)
-            }
-
             ACTION_START_RESIDENT -> {
                 isResidentRequested = true
                 updateResidentNotification()
@@ -100,7 +84,6 @@ class AgentRuntimeService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? {
-        if (!validateCaller()) return null
         boundClientsCount++
         return StubImpl()
     }
@@ -178,11 +161,12 @@ class AgentRuntimeService : Service() {
         private val storeStub = StoreStubImpl()
 
         override fun getStoreBinder(): IBinder? {
-            if (!validateCaller()) return null
+            authorizeCaller(Binder.getCallingUid(), CallerPolicy.Capability.StoreBinder) ?: return null
             return storeStub
         }
 
         override fun submit(query: String?, callback: IRenderFrameCallback?) {
+            authorizeCaller(Binder.getCallingUid(), CallerPolicy.Capability.Submit) ?: return
             val q = query ?: return
             val cb = callback ?: return
 
@@ -282,6 +266,7 @@ class AgentRuntimeService : Service() {
         }
 
         override fun cancel() {
+            authorizeCaller(Binder.getCallingUid(), CallerPolicy.Capability.Cancel) ?: return
             val turn = activeTurn.getAndSet(null)
             if (turn == null) {
                 Logger.i(LOG_TAG, "cancel ignored noActiveTurn=true")
@@ -299,6 +284,7 @@ class AgentRuntimeService : Service() {
         }
 
         override fun resetConversation() {
+            authorizeCaller(Binder.getCallingUid(), CallerPolicy.Capability.ResetConversation) ?: return
             val isIsolated = runBlocking { XRepo.voiceAssistantIsolatedSession() }
             if (isIsolated) {
                 Logger.i(LOG_TAG, "reset conversation requested by host (isolated mode)")
@@ -315,7 +301,9 @@ class AgentRuntimeService : Service() {
 
     private inner class StoreStubImpl : IAgentStoreService.Stub() {
         override fun readStore(storeId: String?): String? {
-            if (!validateCaller()) return null
+            val caller = authorizeCaller(
+                Binder.getCallingUid(), CallerPolicy.Capability.StoreRead, storeId,
+            ) ?: return null
             val id = storeId ?: return null
             val startedAtMs = System.currentTimeMillis()
             val json = runBlocking {
@@ -326,13 +314,18 @@ class AgentRuntimeService : Service() {
                 "StoreStub.readStore storeId=$id result=${json != null} " +
                         "jsonLength=${json?.length ?: 0} elapsedMs=${System.currentTimeMillis() - startedAtMs}"
             )
-            return json
+            return if (caller == CallerPolicy.Caller.Host) {
+                runCatching { CallerPolicy.projectHostStore(id, json) }.onFailure {
+                    Logger.w(LOG_TAG, "Host store projection failed storeId=$id", it)
+                }.getOrNull()
+            } else json
         }
 
-        override fun writeStore(storeId: String?, json: String?) {
-            if (!validateCaller()) return
-            val id = storeId ?: return
-            val j = json ?: return
+        override fun writeStore(storeId: String?, json: String?): Boolean {
+            authorizeCaller(Binder.getCallingUid(), CallerPolicy.Capability.StoreWrite, storeId)
+                ?: return false
+            val id = storeId ?: return false
+            val j = json ?: return false
             val startedAtMs = System.currentTimeMillis()
             runBlocking {
                 XIpcStoreRepository.writeJson(this@AgentRuntimeService, id, j)
@@ -342,10 +335,12 @@ class AgentRuntimeService : Service() {
                 "StoreStub.writeStore storeId=$id jsonLength=${j.length} " +
                         "elapsedMs=${System.currentTimeMillis() - startedAtMs}"
             )
+            return true
         }
 
         override fun mutateStore(storeId: String?, path: String?, valueJson: String?): String? {
-            if (!validateCaller()) return null
+            authorizeCaller(Binder.getCallingUid(), CallerPolicy.Capability.StoreWrite, storeId)
+                ?: return null
             val id = storeId ?: return null
             val p = path ?: return null
             val v = valueJson ?: return null
@@ -362,7 +357,7 @@ class AgentRuntimeService : Service() {
         }
 
         override fun postNotification(title: String?, content: String?, uri: String?) {
-            if (!validateCaller()) return
+            authorizeCaller(Binder.getCallingUid(), CallerPolicy.Capability.Notification) ?: return
             val t = title ?: return
             val c = content ?: return
             postNotificationImpl(t, c, createContentIntent(uri))
@@ -609,11 +604,20 @@ class AgentRuntimeService : Service() {
         Logger.i(LOG_TAG, "binder died, cancelled host frame collector without stopping agent")
     }
 
-    private fun validateCaller(): Boolean {
-        val callingUid = Binder.getCallingUid()
-        val packages = packageManager.getPackagesForUid(callingUid) ?: return false
-        val allowedPackages = setOf(packageName) + HostApp.packageNames.toSet()
-        return packages.any { it in allowedPackages }
+    private fun authorizeCaller(
+        uid: Int,
+        capability: CallerPolicy.Capability,
+        storeId: String? = null,
+    ): CallerPolicy.Caller? {
+        val ownUid = Process.myUid()
+        val packages = if (uid == ownUid) emptySet() else
+            packageManager.getPackagesForUid(uid)?.toSet().orEmpty()
+        val caller = CallerPolicy.identify(uid, ownUid, packages, HostApp.packageNames.toSet())
+        if (!CallerPolicy.allows(caller, capability, storeId)) {
+            Logger.w(LOG_TAG, "IPC denied uid=$uid capability=$capability storeId=$storeId")
+            return null
+        }
+        return caller
     }
 }
 
